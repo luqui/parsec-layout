@@ -10,6 +10,7 @@ module Text.Parsec.Layout
     , spaced           -- (`maybeFollowedBy` space)
     , LayoutEnv        -- type needed to describe parsers
     , defaultLayoutEnv -- a fresh layout
+    , HasLayoutEnv(..) -- for embedding necessary state into a larger parse state
     , semi             -- semicolon or virtual semicolon
     ) where
 
@@ -22,6 +23,7 @@ import Text.Parsec.Combinator
 import Text.Parsec.Pos
 import Text.Parsec.Prim hiding (State)
 import Text.Parsec.Char hiding (space)
+import Control.Lens (Simple, Lens, over, (^.))
 
 data LayoutContext = NoLayout | Layout Int deriving (Eq,Ord,Show)
 
@@ -30,25 +32,37 @@ data LayoutEnv = Env
     , envBol :: Bool -- if true, must run offside calculation
     }
 
+class HasLayoutEnv u where
+    layoutEnv :: Simple Lens u LayoutEnv
+
+instance HasLayoutEnv LayoutEnv where
+    layoutEnv = id
+
 defaultLayoutEnv :: LayoutEnv
 defaultLayoutEnv = Env [] True
 
-pushContext :: Stream s m c => LayoutContext -> ParsecT s LayoutEnv m ()
-pushContext ctx = modifyState $ \env -> env { envLayout = ctx:envLayout env }
+pushContext :: (HasLayoutEnv u, Stream s m c) => LayoutContext -> ParsecT s u m ()
+pushContext ctx = modifyEnv $ \env -> env { envLayout = ctx:envLayout env }
 
-popContext :: Stream s m c => String -> ParsecT s LayoutEnv m ()
+modifyEnv :: (HasLayoutEnv u, Monad m) => (LayoutEnv -> LayoutEnv) -> ParsecT s u m ()
+modifyEnv = modifyState . over layoutEnv
+
+getEnv :: (HasLayoutEnv u, Monad m) => ParsecT s u m LayoutEnv
+getEnv = (^.layoutEnv) <$> getState
+
+popContext :: (HasLayoutEnv u, Stream s m c) => String -> ParsecT s u m ()
 popContext loc = do
-    (_:xs) <- envLayout <$> getState
-    modifyState $ \env' -> env' { envLayout = xs }
+    (_:xs) <- envLayout <$> getEnv
+    modifyEnv $ \env' -> env' { envLayout = xs }
   <|> unexpected ("empty context for " ++ loc)
 
-getIndentation :: Stream s m c => ParsecT s LayoutEnv m Int
-getIndentation = depth . envLayout <$> getState where
+getIndentation :: (HasLayoutEnv u, Stream s m c) => ParsecT s u m Int
+getIndentation = depth . envLayout <$> getEnv where
     depth :: [LayoutContext] -> Int
     depth (Layout n:_) = n
     depth _ = 0
 
-pushCurrentContext :: Stream s m c => ParsecT s LayoutEnv m ()
+pushCurrentContext :: (HasLayoutEnv u, Stream s m c) => ParsecT s u m ()
 pushCurrentContext = do
     indent <- getIndentation
     col <- sourceColumn <$> getPosition
@@ -57,24 +71,24 @@ pushCurrentContext = do
 maybeFollowedBy :: Stream s m c => ParsecT s u m a -> ParsecT s u m b -> ParsecT s u m a
 t `maybeFollowedBy` x = do t' <- t; optional x; return t'
 
-spaced :: Stream s m Char => ParsecT s LayoutEnv m a -> ParsecT s LayoutEnv m a
+spaced :: (HasLayoutEnv u, Stream s m Char) => ParsecT s u m a -> ParsecT s u m a
 spaced t = t `maybeFollowedBy` space
 
 data Layout = VSemi | VBrace | Other Char deriving (Eq,Ord,Show)
 
 -- TODO: Parse C-style #line pragmas out here
-layout :: Stream s m Char => ParsecT s LayoutEnv m Layout
+layout :: (HasLayoutEnv u, Stream s m Char) => ParsecT s u m Layout
 layout = try $ do
-    bol <- envBol <$> getState
+    bol <- envBol <$> getEnv
     whitespace False (cont bol)
   where
-    cont :: Stream s m Char => Bool -> Bool -> ParsecT s LayoutEnv m Layout
+    cont :: (HasLayoutEnv u, Stream s m Char) => Bool -> Bool -> ParsecT s u m Layout
     cont True = offside
     cont False = onside
 
     -- TODO: Parse nestable {-# LINE ... #-} pragmas in here
-    whitespace :: Stream s m Char =>
-        Bool -> (Bool -> ParsecT s LayoutEnv m Layout) -> ParsecT s LayoutEnv m Layout
+    whitespace :: (HasLayoutEnv u, Stream s m Char) =>
+        Bool -> (Bool -> ParsecT s u m Layout) -> ParsecT s u m Layout
     whitespace x k =
             try (string "{-" >> nested k >>= whitespace True)
         <|> try comment
@@ -83,30 +97,30 @@ layout = try $ do
         <|> do (satisfy isSpace <?> "space"); whitespace True k
         <|> k x
 
-    comment :: Stream s m Char => ParsecT s LayoutEnv m Layout
+    comment :: (HasLayoutEnv u, Stream s m Char) => ParsecT s u m Layout
     comment = do
         string "--"
         many (satisfy ('\n'/=))
         newline
         whitespace True offside
 
-    nested :: Stream s m Char =>
-        (Bool -> ParsecT s LayoutEnv m Layout) ->
-        ParsecT s LayoutEnv m (Bool -> ParsecT s LayoutEnv m Layout)
+    nested :: (HasLayoutEnv u, Stream s m Char) =>
+        (Bool -> ParsecT s u m Layout) ->
+        ParsecT s u m (Bool -> ParsecT s u m Layout)
     nested k =
             try (do string "-}"; return k)
         <|> try (do string "{-"; k' <- nested k; nested k')
         <|> do newline; nested offside
         <|> do anyChar; nested k
 
-    offside :: Stream s m Char => Bool -> ParsecT s LayoutEnv m Layout
+    offside :: (HasLayoutEnv u, Stream s m Char) => Bool -> ParsecT s u m Layout
     offside x = do
         p <- getPosition
         pos <- compare (sourceColumn p) <$> getIndentation
         case pos of
             LT -> do
                 popContext "the offside rule"
-                modifyState $ \env -> env { envBol = True }
+                modifyEnv $ \env -> env { envBol = True }
                 return VBrace
             EQ -> return VSemi
             GT -> onside x
@@ -114,30 +128,30 @@ layout = try $ do
     -- we remained onside.
     -- If we skipped any comments, or moved to a new line and stayed onside, we return a single a ' ',
     -- otherwise we provide the next char
-    onside :: Stream s m Char => Bool -> ParsecT s LayoutEnv m Layout
+    onside :: (HasLayoutEnv u, Stream s m Char) => Bool -> ParsecT s u m Layout
     onside True = return $ Other ' '
     onside False = do
-        modifyState $ \env -> env { envBol = False }
+        modifyEnv $ \env -> env { envBol = False }
         Other <$> anyChar
 
-layoutSatisfies :: Stream s m Char => (Layout -> Bool) -> ParsecT s LayoutEnv m ()
+layoutSatisfies :: (HasLayoutEnv u, Stream s m Char) => (Layout -> Bool) -> ParsecT s u m ()
 layoutSatisfies p = guard . p =<< layout
 
-virtual_lbrace :: Stream s m Char => ParsecT s LayoutEnv m ()
+virtual_lbrace :: (HasLayoutEnv u, Stream s m Char) => ParsecT s u m ()
 virtual_lbrace = pushCurrentContext
 
-virtual_rbrace :: Stream s m Char => ParsecT s LayoutEnv m ()
+virtual_rbrace :: (HasLayoutEnv u, Stream s m Char) => ParsecT s u m ()
 virtual_rbrace = eof <|> try (layoutSatisfies (VBrace ==) <?> "outdent")
 
 -- recognize a run of one or more spaces including onside carriage returns in layout
-space :: Stream s m Char => ParsecT s LayoutEnv m String
+space :: (HasLayoutEnv u, Stream s m Char) => ParsecT s u m String
 space = do
     try $ layoutSatisfies (Other ' ' ==)
     return " "
   <?> "space"
 
 -- recognize a semicolon including a virtual semicolon in layout
-semi :: Stream s m Char => ParsecT s LayoutEnv m String
+semi :: (HasLayoutEnv u, Stream s m Char) => ParsecT s u m String
 semi = do
     try $ layoutSatisfies p
     return ";"
@@ -147,19 +161,19 @@ semi = do
         p (Other ';') = True
         p _ = False
 
-lbrace :: Stream s m Char => ParsecT s LayoutEnv m String
+lbrace :: (HasLayoutEnv u, Stream s m Char) => ParsecT s u m String
 lbrace = do
     char '{'
     pushContext NoLayout
     return "{"
 
-rbrace :: Stream s m Char => ParsecT s LayoutEnv m String
+rbrace :: (HasLayoutEnv u, Stream s m Char) => ParsecT s u m String
 rbrace = do
     char '}'
     popContext "a right brace"
     return "}"
 
-laidout :: Stream s m Char => ParsecT s LayoutEnv m a -> ParsecT s LayoutEnv m [a]
+laidout :: (HasLayoutEnv u, Stream s m Char) => ParsecT s u m a -> ParsecT s u m [a]
 laidout p = try (braced statements) <|> vbraced statements where
     braced = between (spaced lbrace) (spaced rbrace)
     vbraced = between (spaced virtual_lbrace) (spaced virtual_rbrace)
