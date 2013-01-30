@@ -1,17 +1,23 @@
 {-# LANGUAGE FlexibleContexts, FlexibleInstances, MultiParamTypeClasses #-}
 
--- Layout combinators by Edward Kmett.
--- http://stackoverflow.com/a/3023615/33796
+-- | These are Haskell-style layout combinators for parsec 3 by Edward Kmett,
+-- first seen on StackOverflow <http://stackoverflow.com/a/3023615/33796>.
+-- Should be fairly self-explanatory, with the following notes:
+--
+-- * You must use the provided `space` combinator to parse spaces.  This interacts poorly with
+-- the "Text.Parsec.Token" modules, unfortunately.
+--
+-- * Uses \"\{\" and \"\}\" for explicit blocks.  This is hard-coded for the time being. 
 
 module Text.Parsec.Layout
-    ( laidout          -- repeat a parser in layout, separated by (virtual) semicolons
-    , space            -- consumes one or more spaces, comments, and onside newlines in a layout rule
+    ( laidout          
+    , semi             
+    , space            
+    , spaced           
+    , LayoutEnv        
+    , defaultLayoutEnv 
+    , HasLayoutEnv(..) 
     , maybeFollowedBy
-    , spaced           -- (`maybeFollowedBy` space)
-    , LayoutEnv        -- type needed to describe parsers
-    , defaultLayoutEnv -- a fresh layout
-    , HasLayoutEnv(..) -- for embedding necessary state into a larger parse state
-    , semi             -- semicolon or virtual semicolon
     ) where
 
 import Control.Applicative ((<$>))
@@ -27,17 +33,21 @@ import Control.Lens (Simple, Lens, over, (^.))
 
 data LayoutContext = NoLayout | Layout Int deriving (Eq,Ord,Show)
 
+-- | Keeps track of necessary context for layout parsers.
 data LayoutEnv = Env
     { envLayout :: [LayoutContext]
     , envBol :: Bool -- if true, must run offside calculation
     }
 
+-- | For embedding layout information into a larger parse state.  Instantiate
+-- this class if you need to use this together with other user state.
 class HasLayoutEnv u where
     layoutEnv :: Simple Lens u LayoutEnv
 
 instance HasLayoutEnv LayoutEnv where
     layoutEnv = id
 
+-- | A fresh layout.
 defaultLayoutEnv :: LayoutEnv
 defaultLayoutEnv = Env [] True
 
@@ -71,6 +81,7 @@ pushCurrentContext = do
 maybeFollowedBy :: Stream s m c => ParsecT s u m a -> ParsecT s u m b -> ParsecT s u m a
 t `maybeFollowedBy` x = do t' <- t; optional x; return t'
 
+-- | @(\``maybeFollowedBy`\` space)@
 spaced :: (HasLayoutEnv u, Stream s m Char) => ParsecT s u m a -> ParsecT s u m a
 spaced t = t `maybeFollowedBy` space
 
@@ -143,14 +154,14 @@ virtual_lbrace = pushCurrentContext
 virtual_rbrace :: (HasLayoutEnv u, Stream s m Char) => ParsecT s u m ()
 virtual_rbrace = eof <|> try (layoutSatisfies (VBrace ==) <?> "outdent")
 
--- recognize a run of one or more spaces including onside carriage returns in layout
+-- | Consumes one or more spaces, comments, and onside newlines in a layout rule.
 space :: (HasLayoutEnv u, Stream s m Char) => ParsecT s u m String
 space = do
     try $ layoutSatisfies (Other ' ' ==)
     return " "
   <?> "space"
 
--- recognize a semicolon including a virtual semicolon in layout
+-- | Recognize a semicolon including a virtual semicolon in layout.
 semi :: (HasLayoutEnv u, Stream s m Char) => ParsecT s u m String
 semi = do
     try $ layoutSatisfies p
@@ -173,6 +184,7 @@ rbrace = do
     popContext "a right brace"
     return "}"
 
+-- | Repeat a parser in layout, separated by (virtual) semicolons.
 laidout :: (HasLayoutEnv u, Stream s m Char) => ParsecT s u m a -> ParsecT s u m [a]
 laidout p = try (braced statements) <|> vbraced statements where
     braced = between (spaced lbrace) (spaced rbrace)
