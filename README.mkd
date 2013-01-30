@@ -1,0 +1,9 @@
+These are layout combinators by Edward Kmett.  First appeared here: http://stackoverflow.com/a/3023615/33796
+
+I've made some modifications and bugfixes.
+
+* Fixed a bug which didn't allow a layout block to start at column 0 (because
+it would never be allowed to end).
+* Use a `HasLayoutEnv` class for the state instead of a plain `LayoutEnv` in
+Parsec's user state parameter, so that this can be composed with other parsers
+that use user state.
